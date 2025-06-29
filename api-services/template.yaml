@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+    RootStackName:
+        Description: The root stack name
+        Type: String
+
+    HostedZone:
+        Description: The services hosted zone
+        Type: AWS::Route53::HostedZone::Id
+
+    PinpointApp:
+        Description: The id of the Pinpoint App
+        Type: String
+
+    EC2InstanceType:
+        Description: EC2 machine instance size (see https://aws.amazon.com/ec2/instance-types/)
+        Type: String
+
+    DBInstanceType:
+        Description: Database Instance Type (see https://aws.amazon.com/rds/instance-types/)
+        Type: String
+
+Resources:
+
+    # VPC
+    VPC:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: 10.0.0.0/16
+            EnableDnsSupport: true
+            EnableDnsHostnames: true
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-vpc
+
+    # INTERNET GATEWAY
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+
+    # ATTACH INTERNET GATEWAY TO VPC
+    AttachGateway:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+            VpcId: !Ref VPC
+            InternetGatewayId: !Ref InternetGateway
+
+    # PRIVATE ROUTE TABLE
+    PrivateRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-private-route-table
+
+    # ROUTE TO THE INTERNET GATEWAY IN THE ROUTE TABLE
+    PrivateRoute:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref InternetGateway
+
+    # SUBNETS
+    PrivateSubnet1:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: 10.0.0.0/20
+            AvailabilityZone: !Select
+                - 0
+                - !GetAZs ap-northeast-2
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-private-subnet-1
+
+    PrivateSubnet2:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: 10.0.16.0/20
+            AvailabilityZone: !Select
+                - 1
+                - !GetAZs ap-northeast-2
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-private-subnet-2
+
+    PrivateSubnet3:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: 10.0.32.0/20
+            AvailabilityZone: !Select
+                - 2
+                - !GetAZs ap-northeast-2
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-private-subnet-3
+
+    # ASSOCIATE PRIVATE SUBNETS WITH ROUTE TABLE
+    SubnetRouteTableAssociation1:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref PrivateSubnet1
+            RouteTableId: !Ref PrivateRouteTable
+
+    SubnetRouteTableAssociation2:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref PrivateSubnet2
+            RouteTableId: !Ref PrivateRouteTable
+
+    SubnetRouteTableAssociation3:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref PrivateSubnet3
+            RouteTableId: !Ref PrivateRouteTable
+
+    # S3 BUCKETS
+    S3UploadBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub ${RootStackName}-upload
+            VersioningConfiguration:
+                Status: Enabled
+
+    S3CacheBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub ${RootStackName}-cache
+            CorsConfiguration:
+                CorsRules:
+                    -   AllowedHeaders:
+                            - '*'
+                        AllowedMethods:
+                            - GET
+                            - HEAD
+                        AllowedOrigins:
+                            - '*'
+                        MaxAge: 3000
+            LifecycleConfiguration:
+                Rules:
+                    -   Id: cache-object-lifecycle
+                        Status: Enabled
+                        ExpirationInDays: 90
+
+    # IAM ROLES
+    EC2Role:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${RootStackName}-ec2-role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service: ec2.amazonaws.com
+                        Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+                - arn:aws:iam::aws:policy/AWSElasticBeanstalkWorkerTier
+                - arn:aws:iam::aws:policy/AWSElasticBeanstalkMulticontainerDocker
+            Policies:
+                -   PolicyName: !Sub ${RootStackName}-get-secrets-value
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -   Effect: Allow
+                                Action:
+                                    - secretsmanager:GetSecretValue
+                                Resource:
+                                    - !GetAtt PostgresRDS.MasterUserSecret.SecretArn
+                                    - !Ref SecretsManager
+                -   PolicyName: !Sub ${RootStackName}-s3-get-put-access
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -   Effect: Allow
+                                Action:
+                                    - s3:PutObject
+                                Resource: !Sub arn:aws:s3:::${S3UploadBucket}/*
+                            -   Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                Resource: !Sub arn:aws:s3:::${S3CacheBucket}/*
+                -   PolicyName: !Sub ${RootStackName}-rds-connect
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -   Effect: Allow
+                                Action:
+                                    - rds-db:connect
+                                Resource: !Sub
+                                    - arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbiResourceId}/xyz
+                                    -   DbiResourceId: !GetAtt PostgresRDS.DbiResourceId
+
+    ServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${RootStackName}-service-role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - elasticbeanstalk.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+                - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+
+    # ENHANCED MONITORING ROLE
+    MonitoringIAMRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - monitoring.rds.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+    InstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            InstanceProfileName: !Sub ${RootStackName}-instance-profile
+            Roles:
+                - !Ref EC2Role
+
+    # EC2 INSTANCES SECURITY GROUP
+    EC2SecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: !Sub ${RootStackName}-ec2-sg
+            GroupDescription: Allow access to EC2 instances
+            VpcId: !Ref VPC
+
+    # RDS SECURITY GROUP
+    RDSSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: !Sub ${RootStackName}-rds-sg
+            GroupDescription: Allow access to RDS instance
+            VpcId: !Ref VPC
+            SecurityGroupIngress:
+                -   IpProtocol: tcp
+                    FromPort: 5432
+                    ToPort: 5432
+                    SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+    # ELASTIC BEANSTALK APPLICATION
+    Application:
+        Type: AWS::ElasticBeanstalk::Application
+        Properties:
+            ApplicationName: !Sub ${RootStackName}-application
+            Description: Instance of services
+
+    # DATABASE SUBNET GROUP
+    DatabaseSubnetGroup:
+        Type: AWS::RDS::DBSubnetGroup
+        Properties:
+            DBSubnetGroupDescription: Subnet group for RDS instance
+            SubnetIds:
+                - !Ref PrivateSubnet1
+                - !Ref PrivateSubnet2
+                - !Ref PrivateSubnet3
+            Tags:
+                -   Key: Name
+                    Value: !Sub ${RootStackName}-db-subnet-group
+
+    # RDS DATABASE
+    PostgresRDS:
+        Type: AWS::RDS::DBInstance
+        Properties:
+            DBInstanceIdentifier: !Sub ${RootStackName}-database
+            MasterUsername: postgres
+            ManageMasterUserPassword: true
+            EnableIAMDatabaseAuthentication: true
+            Engine: postgres
+            EngineVersion: "17"
+            Port: "5432"
+            DBInstanceClass: !Ref DBInstanceType
+            VPCSecurityGroups:
+                - !Ref RDSSecurityGroup
+            DBSubnetGroupName: !Ref DatabaseSubnetGroup
+            AllocatedStorage: "20"
+            MaxAllocatedStorage: 1000
+            StorageType: gp3
+            MultiAZ: false
+            PubliclyAccessible: false
+            StorageEncrypted: true
+
+            # DB Monitoring
+            EnablePerformanceInsights: true
+            MonitoringInterval: 60
+            MonitoringRoleArn: !GetAtt MonitoringIAMRole.Arn
+            CopyTagsToSnapshot: true
+            BackupRetentionPeriod: 35
+            PreferredBackupWindow: 18:12-18:42
+            PreferredMaintenanceWindow: tue:19:17-tue:19:47
+            DeletionProtection: true
+            AutoMinorVersionUpgrade: true
+            EnableCloudwatchLogsExports:
+                - postgresql
+                - upgrade
+
+    # SECRET MANAGER
+    SecretsManager:
+        Type: AWS::SecretsManager::Secret
+        Properties:
+            Name: !Sub ${RootStackName}-services-secrets
+            GenerateSecretString:
+                # WARNING any change will cause the secret to be rotated and manual updates to be lost
+                SecretStringTemplate: '{"JWT_SECRET": "", "FIREBASE_ACCOUNT_KEY": ""}'
+                GenerateStringKey: JWT_SECRET
+                PasswordLength: 32
+
+    # Certificate
+    APICertificate:
+        Type: AWS::CertificateManager::Certificate
+        Properties:
+            DomainName: !Sub api.${RootStackName}.xyz.co.kr
+            ValidationMethod: DNS
+            DomainValidationOptions:
+                -   DomainName: !Sub api.${RootStackName}.xyz.co.kr
+                    HostedZoneId: !Ref HostedZone
+
+    # CONFIGURATION TEMPLATE
+    ConfigurationTemplate:
+        Type: AWS::ElasticBeanstalk::ConfigurationTemplate
+        Properties:
+            ApplicationName: !Ref Application
+            Description: Beanstalk App Configuration Template
+            PlatformArn: !Sub arn:aws:elasticbeanstalk:${AWS::Region}::platform/Node.js 22 running on 64bit Amazon Linux 2023/6.4.1
+            OptionSettings:
+
+                # ENVIRONMENT SETTINGS
+                -   Namespace: aws:elasticbeanstalk:environment
+                    OptionName: EnvironmentType
+                    Value: LoadBalanced
+                -   Namespace: aws:elasticbeanstalk:environment
+                    OptionName: LoadBalancerType
+                    Value: application
+                -   Namespace: aws:elasticbeanstalk:environment
+                    OptionName: ServiceRole
+                    Value: !Ref ServiceRole
+
+                # AUTOSCALING OPTIONS
+                -   Namespace: aws:autoscaling:asg
+                    OptionName: MinSize
+                    Value: "1"
+                -   Namespace: aws:autoscaling:asg
+                    OptionName: MaxSize
+                    Value: "4"
+                -   Namespace: aws:autoscaling:launchconfiguration
+                    OptionName: IamInstanceProfile
+                    Value: !Ref InstanceProfile
+                -   Namespace: aws:autoscaling:launchconfiguration
+                    OptionName: InstanceType
+                    Value: !Ref EC2InstanceType
+                -   Namespace: aws:autoscaling:launchconfiguration
+                    OptionName: SecurityGroups
+                    Value: !Ref EC2SecurityGroup
+                -   Namespace: aws:autoscaling:trigger
+                    OptionName: MeasureName
+                    Value: CPUUtilization
+                -   Namespace: aws:autoscaling:trigger
+                    OptionName: Statistic
+                    Value: Average
+                -   Namespace: aws:autoscaling:trigger
+                    OptionName: Unit
+                    Value: Percent
+                -   Namespace: aws:autoscaling:trigger
+                    OptionName: UpperThreshold
+                    Value: "70"
+                -   Namespace: aws:autoscaling:trigger
+                    OptionName: LowerThreshold
+                    Value: "30"
+
+                # CLOUDWATCH LOGS
+                -   Namespace: aws:elasticbeanstalk:cloudwatch:logs
+                    OptionName: StreamLogs
+                    Value: "true"
+                -   Namespace: aws:elasticbeanstalk:cloudwatch:logs
+                    OptionName: RetentionInDays
+                    Value: "365"
+
+                # HEALTH REPORTING
+                -   Namespace: aws:elasticbeanstalk:cloudwatch:logs:health
+                    OptionName: HealthStreamingEnabled
+                    Value: "true"
+                -   Namespace: aws:elasticbeanstalk:cloudwatch:logs:health
+                    OptionName: RetentionInDays
+                    Value: "365"
+                -   Namespace: aws:elasticbeanstalk:healthreporting:system
+                    OptionName: SystemType
+                    Value: enhanced
+                -   Namespace: aws:elasticbeanstalk:environment:process:default
+                    OptionName: HealthCheckPath
+                    Value: /health
+
+                # UPDATES
+                -   Namespace: aws:elasticbeanstalk:managedactions
+                    OptionName: ManagedActionsEnabled
+                    Value: "true"
+                -   Namespace: aws:elasticbeanstalk:managedactions
+                    OptionName: PreferredStartTime
+                    Value: Wed:19:22
+                -   Namespace: aws:elasticbeanstalk:managedactions:platformupdate
+                    OptionName: UpdateLevel
+                    Value: minor
+                -   Namespace: aws:elasticbeanstalk:managedactions:platformupdate
+                    OptionName: InstanceRefreshEnabled
+                    Value: "true"
+
+                # APPLICATION DEPLOYMENT
+                -   Namespace: aws:elasticbeanstalk:command
+                    OptionName: DeploymentPolicy
+                    Value: Immutable
+                -   Namespace: aws:autoscaling:updatepolicy:rollingupdate
+                    OptionName: RollingUpdateType
+                    Value: Immutable
+
+                # SNS NOTIFICATIONS
+                -   Namespace: aws:elasticbeanstalk:sns:topics
+                    OptionName: Notification Endpoint
+                    Value: devops@xyz.co.kr
+                -   Namespace: aws:elasticbeanstalk:sns:topics
+                    OptionName: Notification Protocol
+                    Value: email
+
+                # VPC SETTINGS
+                -   Namespace: aws:ec2:vpc
+                    OptionName: VPCId
+                    Value: !Ref VPC
+                -   Namespace: aws:ec2:vpc
+                    OptionName: AssociatePublicIpAddress
+                    Value: "true"
+                -   Namespace: aws:ec2:vpc
+                    OptionName: Subnets
+                    Value: !Join
+                        - ','
+                        -   - !Ref PrivateSubnet1
+                            - !Ref PrivateSubnet2
+                            - !Ref PrivateSubnet3
+
+                # LOAD BALANCER
+                -   Namespace: aws:elbv2:listener:443
+                    OptionName: Protocol
+                    Value: HTTPS
+                -   Namespace: aws:elbv2:listener:443
+                    OptionName: SSLCertificateArns
+                    Value: !Ref APICertificate
+                -   Namespace: aws:elbv2:listener:443
+                    OptionName: SSLPolicy
+                    Value: ELBSecurityPolicy-TLS13-1-3-2021-06
+                -   Namespace: aws:elbv2:listener:default
+                    OptionName: ListenerEnabled
+                    Value: "false"
+
+    # ENVIRONMENT
+    Environment:
+        Type: AWS::ElasticBeanstalk::Environment
+        Properties:
+            Description: Beanstalk App Environment
+            ApplicationName: !Ref Application
+            EnvironmentName: !Sub ${RootStackName}-services
+            TemplateName: !Ref ConfigurationTemplate
+            OptionSettings:
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: AWS_REGION
+                    Value: !Ref AWS::Region
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: DATABASE_HOST
+                    Value: !GetAtt PostgresRDS.Endpoint.Address
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: AWS_ENV_SECRET_ARN
+                    Value: !Ref SecretsManager
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: S3_UPLOAD_BUCKET
+                    Value: !Ref S3UploadBucket
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: S3_CACHE_BUCKET
+                    Value: !Ref S3CacheBucket
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: IMAGES_BASE
+                    Value: !Sub https://image.${RootStackName}.xyz.co.kr
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: KAKAO_REST_API_KEY
+                    Value: ce9c6090ff560f5d6188cb7fd7f3bc14
+                -   Namespace: aws:elasticbeanstalk:application:environment
+                    OptionName: PINPOINT_PROJECT_ID
+                    Value: !Ref PinpointApp
+
+    # API RECORD IN HOSTED ZONE
+    APIRecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            HostedZoneId: !Ref HostedZone
+            Name: !Sub api.${RootStackName}.xyz.co.kr
+            Type: A
+            AliasTarget:
+                DNSName: !GetAtt Environment.EndpointURL
+
+                # CF: https://docs.aws.amazon.com/general/latest/gr/elb.html
+                # CF: https://repost.aws/questions/QUxBm_VpvST7a_2mTd8aNKZA/configure-dns-record-in-cloudformation-for-elastic-beanstalk-environment
+                HostedZoneId: ZWKZPGTI48KDX
